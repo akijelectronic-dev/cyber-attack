@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Cyber Threat Map</title>
+<style>
+  :root{
+    --bg:#03060c; --red:#ff2a4d; --cyan:#00f0ff; --text:#cfe9ee; --dim:#6f8a93;
+    --glass:rgba(8,16,26,.55); --edge:rgba(0,240,255,.22);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--bg);color:var(--text);overflow:hidden;
+    font-family:"SF Mono","Cascadia Mono",Consolas,Menlo,monospace}
+  #globe{position:fixed;inset:0}
+  #globe canvas{display:block;cursor:grab}
+  #globe canvas:active{cursor:grabbing}
+
+  #panel{position:fixed;top:16px;left:16px;bottom:16px;width:340px;max-width:calc(100vw - 32px);
+    display:flex;flex-direction:column;gap:14px;padding:18px;
+    background:var(--glass);border:1px solid var(--edge);border-radius:14px;
+    backdrop-filter:blur(16px) saturate(140%);-webkit-backdrop-filter:blur(16px) saturate(140%);
+    box-shadow:0 0 40px rgba(0,240,255,.08), inset 0 0 30px rgba(255,42,77,.04);z-index:5}
+  h1{font-size:15px;font-weight:600;letter-spacing:.08em;color:var(--cyan);text-shadow:0 0 10px rgba(0,240,255,.5)}
+  .sub{font-size:11px;color:var(--dim);margin-top:3px}
+  .counter{padding:12px 14px;border:1px solid rgba(255,42,77,.35);border-radius:10px;background:rgba(255,42,77,.07)}
+  .counter .label{font-size:11px;color:var(--dim)}
+  .counter .num{font-size:38px;line-height:1.1;font-weight:700;color:var(--red);text-shadow:0 0 18px rgba(255,42,77,.7)}
+  .counter .meta{font-size:11px;color:var(--dim);margin-top:2px}
+  h2{font-size:12px;font-weight:600;color:var(--cyan);display:flex;align-items:center;gap:8px}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:0 0 8px var(--red);animation:blink 1.2s infinite}
+  @keyframes blink{50%{opacity:.25}}
+  #feed{flex:1;overflow-y:auto;list-style:none;font-size:11.5px;line-height:1.45;
+    scrollbar-width:thin;scrollbar-color:var(--edge) transparent;margin-right:-6px;padding-right:6px}
+  #feed li{padding:7px 0 7px 10px;border-left:2px solid var(--red);margin-bottom:6px;background:linear-gradient(90deg,rgba(255,42,77,.09),transparent)}
+  #feed li.new{animation:flash .9s ease-out}
+  @keyframes flash{from{background:rgba(0,240,255,.35)}}
+  #feed li b{color:var(--red);font-weight:600}
+  #feed li span{color:var(--cyan)}
+  #feed li small{display:block;color:var(--dim);font-size:10.5px}
+  #feed li.sys{border-color:var(--cyan);background:none;color:var(--dim)}
+  #feed li.err{border-color:#ffb020;color:#ffb020;background:none}
+  #status{font-size:11px;color:var(--dim);display:flex;justify-content:space-between;gap:8px}
+  #status em{font-style:normal;color:var(--cyan)}
+  @media (max-width:640px){
+    #panel{top:auto;height:44vh;bottom:8px;left:8px;right:8px;width:auto;max-width:none}
+  }
+  @media (prefers-reduced-motion:reduce){.dot,#feed li.new{animation:none}}
+</style>
+</head>
+<body>
+<div id="globe"></div>
+
+<aside id="panel">
+  <div>
+    <h1>CYBER THREAT MAP</h1>
+    <div class="sub">Botnet C2 servers · Feodo Tracker (abuse.ch)</div>
+  </div>
+  <div class="counter">
+    <div class="label">Total Active Threats</div>
+    <div class="num" id="total">0</div>
+    <div class="meta" id="meta">waiting for data…</div>
+  </div>
+  <h2><span class="dot"></span>Live Threat Feed</h2>
+  <ul id="feed"></ul>
+  <div id="status"><span id="stat">Starting…</span><span>Next sync <em id="timer">--:--</em></span></div>
+</aside>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(() => {
+  "use strict";
+
+  /* ---------- Config ---------- */
+  const FEODO_URL = "https://feodotracker.abuse.ch/downloads/ipblocklist.json";
+  // Fallback CORS proxies, used only if the direct request is blocked by the browser.
+  const PROXIES = [
+    u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+    u => "https://corsproxy.io/?" + encodeURIComponent(u)
+  ];
+  const REFRESH_MS = 5 * 60 * 1000;
+  const EARTH_TEX = "https://unpkg.com/three-globe/example/img/earth-dark.jpg";
+  const MAX_FEED = 120;
+  const $ = id => document.getElementById(id);
+
+  /* ---------- State ---------- */
+  const geoCache = new Map();      // ip -> {lat, lon, country}
+  try { // persist geolocation between visits (saves API calls)
+    const saved = JSON.parse(localStorage.getItem("threatGeoCache") || "{}");
+    Object.entries(saved).forEach(([k, v]) => geoCache.set(k, v));
+  } catch (_) {}
+  const plotted = new Map();       // ip -> sprite
+  let nextSync = Date.now() + REFRESH_MS;
+  let running = false;
+
+  /* ---------- UI helpers ---------- */
+  function feed(html, cls) {
+    const li = document.createElement("li");
+    li.className = (cls || "") + (cls ? "" : " new");
+    li.innerHTML = html;
+    const list = $("feed");
+    list.prepend(li);
+    while (list.children.length > MAX_FEED) list.lastChild.remove();
+  }
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const setStat = t => $("stat").textContent = t;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function fetchJSON(url, opts, timeout = 20000) {
+    let timer;
+    const limit = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("Request timed out")), timeout); });
+    try {
+      const res = await Promise.race([fetch(url, opts || {}), limit]);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await Promise.race([res.json(), limit]);
+    } finally { clearTimeout(timer); }
+
+  }
+
+  /* ---------- 3D globe ---------- */
+  const host = $("globe");
+  if (typeof THREE === "undefined") {
+    feed("Three.js failed to load. Check your connection.", "err");
+    return;
+  }
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+  camera.position.set(0, 0, 3.4);
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  host.appendChild(renderer.domElement);
+
+  const world = new THREE.Group();
+  scene.add(world);
+
+  const earthMat = new THREE.MeshBasicMaterial({ color: 0x0a1c2a });
+  const earth = new THREE.Mesh(new THREE.SphereGeometry(1, 64, 64), earthMat);
+  world.add(earth);
+  new THREE.TextureLoader().setCrossOrigin("anonymous").load(
+    EARTH_TEX,
+    tex => { earthMat.map = tex; earthMat.color.set(0x9fdcff); earthMat.needsUpdate = true; },
+    undefined,
+    () => { // texture unavailable: fall back to a lat/long grid look
+      world.add(new THREE.Mesh(new THREE.SphereGeometry(1.001, 36, 18),
+        new THREE.MeshBasicMaterial({ color: 0x00f0ff, wireframe: true, transparent: true, opacity: .18 })));
+    }
+  );
+
+  // Atmosphere glow
+  scene.add(new THREE.Mesh(
+    new THREE.SphereGeometry(1.14, 64, 64),
+    new THREE.ShaderMaterial({
+      transparent: true, side: THREE.BackSide, blending: THREE.AdditiveBlending, depthWrite: false,
+      vertexShader: "varying vec3 n;void main(){n=normalize(normalMatrix*normal);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}",
+      fragmentShader: "varying vec3 n;void main(){float i=pow(0.62-dot(n,vec3(0,0,1.)),3.);gl_FragColor=vec4(0.,.94,1.,1.)*i;}"
+    })
+  ));
+
+  // Star field
+  {
+    const g = new THREE.BufferGeometry(), p = [];
+    for (let i = 0; i < 900; i++) {
+      const r = 20 + Math.random() * 30, a = Math.random() * 6.283, b = Math.acos(2 * Math.random() - 1);
+      p.push(r * Math.sin(b) * Math.cos(a), r * Math.sin(b) * Math.sin(a), r * Math.cos(b));
+    }
+    g.setAttribute("position", new THREE.Float32BufferAttribute(p, 3));
+    scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x88aabb, size: .07, sizeAttenuation: true })));
+  }
+
+  // Glow texture for the threat dots
+  const glowTex = (() => {
+    const c = document.createElement("canvas"); c.width = c.height = 64;
+    const x = c.getContext("2d"), g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    g.addColorStop(0, "rgba(255,255,255,1)");
+    g.addColorStop(.18, "rgba(255,60,90,1)");
+    g.addColorStop(.5, "rgba(255,42,77,.35)");
+    g.addColorStop(1, "rgba(255,42,77,0)");
+    x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+    return new THREE.CanvasTexture(c);
+  })();
+
+  function latLonToVec3(lat, lon, r) {
+    const phi = (90 - lat) * Math.PI / 180, theta = (lon + 180) * Math.PI / 180;
+    return new THREE.Vector3(-r * Math.sin(phi) * Math.cos(theta), r * Math.cos(phi), r * Math.sin(phi) * Math.sin(theta));
+  }
+
+  function plot(ip, geo) {
+    if (plotted.has(ip)) return;
+    const s = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex, color: 0xff2a4d, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending
+    }));
+    s.position.copy(latLonToVec3(geo.lat, geo.lon, 1.012));
+    s.userData.phase = Math.random() * Math.PI * 2;
+    s.scale.setScalar(0.001);
+    world.add(s);
+    plotted.set(ip, s);
+  }
+
+  /* ---------- Interaction (drag to rotate, wheel/pinch to zoom) ---------- */
+  let dragging = false, lx = 0, ly = 0, vx = 0, vy = 0, idle = 0;
+  const el = renderer.domElement;
+  el.addEventListener("pointerdown", e => { dragging = true; lx = e.clientX; ly = e.clientY; el.setPointerCapture(e.pointerId); });
+  el.addEventListener("pointermove", e => {
+    if (!dragging) return;
+    vx = (e.clientX - lx) * 0.005; vy = (e.clientY - ly) * 0.005;
+    world.rotation.y += vx; world.rotation.x = Math.max(-1.2, Math.min(1.2, world.rotation.x + vy));
+    lx = e.clientX; ly = e.clientY; idle = 0;
+  });
+  el.addEventListener("pointerup", () => dragging = false);
+  el.addEventListener("wheel", e => {
+    e.preventDefault();
+    camera.position.z = Math.max(1.8, Math.min(6, camera.position.z + e.deltaY * 0.002));
+  }, { passive: false });
+  addEventListener("resize", () => {
+    camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const clock = new THREE.Clock();
+  (function loop() {
+    requestAnimationFrame(loop);
+    const t = clock.getElapsedTime();
+    if (!dragging && !reduceMotion) world.rotation.y += 0.0012;
+    plotted.forEach(s => {
+      const p = s.userData.phase, k = 0.5 + 0.5 * Math.sin(t * 2.4 + p); // pulse 0..1
+      const target = 0.045 + 0.04 * k;
+      s.scale.setScalar(s.scale.x + (target - s.scale.x) * 0.12);       // eases in after plotting
+      s.material.opacity = 0.55 + 0.45 * k;
+    });
+    renderer.render(scene, camera);
+  })();
+
+  /* ---------- Data: Feodo Tracker ---------- */
+  async function loadFeodo() {
+    const attempts = [FEODO_URL, ...PROXIES.map(p => p(FEODO_URL))];
+    let lastErr;
+    for (const url of attempts) {
+      try {
+        const data = await fetchJSON(url);
+        // The feed is an array of entries; tolerate a wrapped object just in case.
+        const list = Array.isArray(data) ? data : (data.blocklist || data.data || []);
+        if (!Array.isArray(list)) throw new Error("Unexpected response format");
+        return list.filter(x => x && x.ip_address);
+      } catch (e) { lastErr = e; }
+    }
+    throw lastErr || new Error("Feodo Tracker unreachable");
+  }
+
+  /* ---------- Data: geolocation ---------- */
+  // ip-api.com's free tier only serves plain HTTP. Browsers block that from an HTTPS page
+  // (mixed content), so on HTTPS we use ipwho.is, a free HTTPS-enabled alternative.
+  const canUseIpApi = location.protocol === "http:" || location.protocol === "file:";
+
+  async function geolocate(ips) {
+    const todo = ips.filter(ip => !geoCache.has(ip));
+    if (!todo.length) return;
+
+    if (canUseIpApi) {
+      for (let i = 0; i < todo.length; i += 100) {            // batch endpoint: 100 IPs per call
+        const chunk = todo.slice(i, i + 100);
+        setStat(`Geolocating ${Math.min(i + 100, todo.length)}/${todo.length}…`);
+        try {
+          const res = await fetchJSON(
+            "http://ip-api.com/batch?fields=status,message,country,lat,lon,query",
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(chunk) }
+          );
+          res.forEach(r => { if (r.status === "success") geoCache.set(r.query, { lat: r.lat, lon: r.lon, country: r.country }); });
+        } catch (e) {
+          feed(`Geolocation batch failed: ${esc(e.message)}`, "err");
+          if (/429/.test(e.message)) await sleep(60000);
+        }
+        if (i + 100 < todo.length) await sleep(4500);         // stay under 15 requests/min
+      }
+    } else {
+      let done = 0;
+      const worker = async () => {
+        while (todo.length) {
+          const ip = todo.shift();
+          try {
+            const r = await fetchJSON("https://ipwho.is/" + encodeURIComponent(ip), {}, 10000);
+            if (r.success) geoCache.set(ip, { lat: r.latitude, lon: r.longitude, country: r.country });
+          } catch (_) { /* skip this IP, keep going */ }
+          setStat(`Geolocating… ${++done}`);
+          await sleep(120);
+        }
+      };
+      await Promise.all([worker(), worker(), worker()]);
+    }
+    try { localStorage.setItem("threatGeoCache", JSON.stringify(Object.fromEntries(geoCache))); } catch (_) {}
+  }
+
+  /* ---------- Main sync ---------- */
+  async function sync() {
+    if (running) return;
+    running = true;
+    nextSync = Date.now() + REFRESH_MS;
+    setStat("Fetching Feodo Tracker…");
+    try {
+      const list = await loadFeodo();
+      const online = list.filter(x => String(x.status).toLowerCase() === "online").length;
+      $("meta").textContent = `${list.length} C2 servers listed · ${online} online`;
+      feed(`Feodo Tracker synced: ${list.length} C2 servers.`, "sys");
+
+      await geolocate(list.map(x => x.ip_address));
+
+      // Plot only entries we haven't plotted yet, a few at a time so the feed feels live.
+      const fresh = list.filter(x => !plotted.has(x.ip_address) && geoCache.has(x.ip_address));
+      const alive = new Set(list.map(x => x.ip_address));
+      for (const [ip, sprite] of plotted) {                   // drop IPs no longer on the list
+        if (!alive.has(ip)) { world.remove(sprite); plotted.delete(ip); }
+      }
+      for (const item of fresh) {
+        const geo = geoCache.get(item.ip_address);
+        plot(item.ip_address, geo);
+        const extra = [item.malware, item.port && ("port " + item.port)].filter(Boolean).join(" · ");
+        feed(`<b>C2 Server</b> detected in <span>${esc(geo.country || item.country || "Unknown")}</span> ` +
+             `(IP: ${esc(item.ip_address)})${extra ? `<small>${esc(extra)}</small>` : ""}`);
+        $("total").textContent = plotted.size;
+        await sleep(reduceMotion ? 0 : 60);
+      }
+      $("total").textContent = plotted.size;
+      const missed = list.length - [...alive].filter(ip => plotted.has(ip)).length;
+      setStat(missed > 0 ? `Live · ${missed} IPs couldn’t be located` : "Live");
+    } catch (e) {
+      console.error(e);
+      feed(`Could not load threat data: ${esc(e.message)}. Retrying at next sync.`, "err");
+      setStat("Error: retrying at next sync");
+    } finally {
+      running = false;
+    }
+  }
+
+  setInterval(() => {
+    const left = Math.max(0, nextSync - Date.now());
+    $("timer").textContent = String(Math.floor(left / 60000)).padStart(2, "0") + ":" +
+                             String(Math.floor(left / 1000) % 60).padStart(2, "0");
+  }, 1000);
+  setInterval(sync, REFRESH_MS);
+  sync();
+})();
+</script>
+</body>
+</html>
